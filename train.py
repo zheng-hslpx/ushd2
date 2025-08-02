@@ -35,7 +35,7 @@ num_instances = 10  # 算例数量
 TRAINING_CONFIG = {
     'max_episodes': 1000,  # 最大训练回合数
     'max_steps_per_episode': num_tasks * 10,  # 每个训练回合的最大步数
-    'early_stop_patience': 200,  # 早停耐心值
+    'early_stop_patience': 1000,  # 早停耐心值
     'seed': 42,  # 随机种子
     'eta': 2,  # 构建异构图时考虑的最近邻任务数量
 }
