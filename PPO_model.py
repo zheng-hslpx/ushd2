@@ -2,18 +2,21 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 import numpy as np
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
 class Memory:
-    """经验回放缓冲区"""
+    """改进的经验回放缓冲区"""
+
     def __init__(self):
         self.actions = []
         self.states = []
         self.logprobs = []
         self.rewards = []
         self.is_terminals = []
-        self.state_values = [] # 新增：存储旧的状态价值
+        self.state_values = []
+        self.returns = []  # 新增：存储计算好的returns
+        self.advantages = []  # 新增：存储计算好的advantages
 
     def clear_memory(self):
         """清空缓冲区"""
@@ -22,134 +25,166 @@ class Memory:
         del self.logprobs[:]
         del self.rewards[:]
         del self.is_terminals[:]
-        del self.state_values[:] # 新增：清空旧的状态价值
+        del self.state_values[:]
+        del self.returns[:]
+        del self.advantages[:]
+
 
 class ActorCritic(nn.Module):
-    """Actor-Critic网络"""
-    def __init__(self, hgnn, action_dim, hidden_dim=128):
+    """改进的Actor-Critic网络"""
+
+    def __init__(self, hgnn, action_dim, hidden_dim=256):
         super().__init__()
         self.hgnn = hgnn
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
 
-        # 共享特征层
-        self.shared_net = nn.Sequential(
+        # 改进1: 分离Actor和Critic的特征提取
+        # Actor网络
+        self.actor_feature = nn.Sequential(
             nn.Linear(hgnn.hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # 使用LayerNorm替代BatchNorm
             nn.ReLU(),
             nn.Dropout(0.1)
         )
 
-        # Actor网络 - 添加残差连接
-        self.actor_net = nn.Sequential(
+        self.actor_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, action_dim)
         )
 
-        # Critic网络
-        self.critic_net = nn.Sequential(
+        # Critic网络 - 独立的特征提取
+        self.critic_feature = nn.Sequential(
+            nn.Linear(hgnn.hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+
+        self.critic_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
 
-        # 初始化权重
+        # 改进2: 更好的初始化
         self.apply(self._init_weights)
 
+        # 特别处理最后一层
+        nn.init.orthogonal_(self.actor_head[-1].weight, gain=0.01)
+        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
+
     def _init_weights(self, module):
-        """权重初始化"""
+        """改进的权重初始化"""
         if isinstance(module, nn.Linear):
-            nn.init.orthogonal_(module.weight, gain=0.01)
+            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
 
     def act(self, state, device, action_mask=None):
         """选择动作"""
-        # 通过HGNN获取图嵌入
-        graph_embedding = self.hgnn(state).to(device)
-        shared_features = self.shared_net(graph_embedding)
+        with torch.no_grad():
+            # 通过HGNN获取图嵌入
+            graph_embedding = self.hgnn(state).to(device)
 
-        # 计算动作logits
-        action_logits = self.actor_net(shared_features)
+            # Actor分支
+            actor_features = self.actor_feature(graph_embedding)
+            action_logits = self.actor_head(actor_features)
 
-        # 应用action mask(动作掩码)
-        if action_mask is not None:
-            action_mask_tensor = torch.from_numpy(action_mask).to(device)
-            action_logits = action_logits.masked_fill(~action_mask_tensor, -1e8)
+            # Critic分支
+            critic_features = self.critic_feature(graph_embedding)
+            state_val = self.critic_head(critic_features)
 
-        # 计算动作概率和采样
-        action_probs = torch.softmax(action_logits, dim=-1)
-        dist = torch.distributions.Categorical(action_probs)
+            # 应用action mask
+            if action_mask is not None:
+                action_mask_tensor = torch.from_numpy(action_mask).to(device)
+                # 使用更稳定的mask值
+                action_logits = action_logits.masked_fill(~action_mask_tensor, -1e10)
 
-        action = dist.sample()
-        action_logprob = dist.log_prob(action)
+            # 计算动作概率和采样
+            action_probs = torch.softmax(action_logits, dim=-1)
 
-        # 计算状态价值
-        state_val = self.critic_net(shared_features)
+            # 添加噪声以增加探索
+            if torch.rand(1).item() < 0.05:  # 5%概率添加噪声
+                noise = torch.randn_like(action_probs) * 0.1
+                action_probs = torch.softmax(action_logits + noise, dim=-1)
 
-        return action.detach().cpu().item(), action_logprob.detach(), state_val.detach()
+            dist = Categorical(action_probs)
+            action = dist.sample()
+            action_logprob = dist.log_prob(action)
 
-    def evaluate(self, states, actions):
+        return action.item(), action_logprob, state_val
+
+    def evaluate(self, states, actions, device):
         """评估状态-动作对"""
         graph_embeddings = []
         for s in states:
-            emb = self.hgnn(s)
+            emb = self.hgnn(s.to(device))
             graph_embeddings.append(emb)
 
         graph_embeddings = torch.stack(graph_embeddings)
-        shared_features = self.shared_net(graph_embeddings)
+
+        # Actor分支
+        actor_features = self.actor_feature(graph_embeddings)
+        action_logits = self.actor_head(actor_features)
+
+        # Critic分支
+        critic_features = self.critic_feature(graph_embeddings)
+        state_values = self.critic_head(critic_features)
 
         # 计算动作概率
-        action_logits = self.actor_net(shared_features)
         action_probs = torch.softmax(action_logits, dim=-1)
-        dist = torch.distributions.Categorical(action_probs)
+        dist = Categorical(action_probs)
 
-        # 计算log概率、熵和状态价值
+        # 计算log概率和熵
         action_logprobs = dist.log_prob(actions)
         dist_entropy = dist.entropy()
-        state_values = self.critic_net(shared_features)
 
-        return action_logprobs, torch.squeeze(state_values, -1), dist_entropy
+        return action_logprobs, state_values.squeeze(-1), dist_entropy
 
 
 class PPO:
-    """PPO算法实现"""
-    def __init__(self, hgnn, action_dim, lr=1e-4, gamma=0.99, eps_clip=0.15,
-                 K_epochs=8, device='cpu', entropy_coef=0.02, value_coef=0.5):
+    """改进的PPO算法实现"""
+
+    def __init__(self, hgnn, action_dim, lr_actor=3e-4, lr_critic=1e-3,
+                 gamma=0.99, eps_clip=0.2, K_epochs=10, device='cpu',
+                 entropy_coef=0.01, value_coef=1.0, gae_lambda=0.95):
+
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
         self.device = device
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
+        self.gae_lambda = gae_lambda  # GAE参数
 
-        # 创建当前策略和旧策略网络
+        # 创建网络
         self.policy = ActorCritic(hgnn, action_dim).to(device)
         self.policy_old = ActorCritic(hgnn, action_dim).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
 
-        # 使用AdamW优化器，更好的权重衰减
-        self.optimizer = torch.optim.AdamW(
-            self.policy.parameters(),
-            lr=lr,
-            weight_decay=1e-4,
+        # 改进3: 分离Actor和Critic的优化器
+        self.actor_optimizer = torch.optim.Adam(
+            list(self.policy.actor_feature.parameters()) +
+            list(self.policy.actor_head.parameters()),
+            lr=lr_actor,
             eps=1e-5
         )
 
-        # 学习率调度器
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.8,
-            patience=50,
-            verbose=True
+        self.critic_optimizer = torch.optim.Adam(
+            list(self.policy.critic_feature.parameters()) +
+            list(self.policy.critic_head.parameters()),
+            lr=lr_critic,  # Critic使用更高的学习率
+            eps=1e-5
         )
 
+        # 改进4: 使用余弦退火学习率调度
+        self.actor_scheduler = CosineAnnealingLR(self.actor_optimizer, T_max=1000, eta_min=1e-5)
+        self.critic_scheduler = CosineAnnealingLR(self.critic_optimizer, T_max=1000, eta_min=1e-4)
+
         # 损失函数
-        self.value_loss_fn = nn.SmoothL1Loss()
+        self.mse_loss = nn.MSELoss()
 
         # 统计信息
         self.update_count = 0
@@ -159,87 +194,108 @@ class PPO:
         graph = state
         action_mask = getattr(graph, 'action_mask', None)
 
-        with torch.no_grad():
-            action, action_logprob, state_value = self.policy_old.act(
-                graph, self.device, action_mask
-            )
+        action, action_logprob, state_value = self.policy_old.act(
+            graph, self.device, action_mask
+        )
 
         return action, action_logprob.cpu(), state_value.cpu()
 
+    def compute_gae(self, rewards, values, is_terminals):
+        """计算Generalized Advantage Estimation (GAE)"""
+        advantages = []
+        returns = []
+
+        gae = 0
+        next_value = 0
+
+        for t in reversed(range(len(rewards))):
+            if is_terminals[t]:
+                next_value = 0
+                gae = 0
+
+            delta = rewards[t] + self.gamma * next_value - values[t]
+            gae = delta + self.gamma * self.gae_lambda * gae
+
+            advantages.insert(0, gae)
+            returns.insert(0, gae + values[t])
+
+            next_value = values[t]
+
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(self.device)
+        returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
+
+        # 标准化advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        return returns, advantages
+
     def update(self, memory):
-        """更新PPO策略"""
-        # 计算折扣奖励
-        rewards = []
-        discounted_reward = 0
-
-        for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
-            if is_terminal:
-                discounted_reward = reward
-            else:
-                discounted_reward = reward + (self.gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
-
-        # 奖励标准化 - 使用更稳定的方法
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
-        if len(rewards) > 1:
-            reward_mean = rewards.mean()
-            reward_std = rewards.std() + 1e-8
-            rewards = (rewards - reward_mean) / reward_std
-
+        """改进的PPO更新"""
         # 准备数据
         old_states = memory.states
         old_actions = torch.tensor(memory.actions, dtype=torch.long).to(self.device)
         old_logprobs = torch.stack(memory.logprobs).to(self.device).detach()
-        old_state_values = torch.stack(memory.state_values).to(self.device).detach()
+        old_state_values = torch.stack(memory.state_values).squeeze().to(self.device).detach()
 
-        # 计算优势
-        advantages = rewards - old_state_values.squeeze()
+        # 计算GAE
+        returns, advantages = self.compute_gae(
+            memory.rewards,
+            old_state_values.cpu().numpy(),
+            memory.is_terminals
+        )
 
-        # 优势标准化
-        if len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # 保存初始损失用于监控
+        total_actor_loss = 0
+        total_critic_loss = 0
+        total_entropy = 0
 
         # 多轮优化
-        total_policy_loss = 0
-        total_value_loss = 0
-        total_entropy_loss = 0
-
         for epoch in range(self.K_epochs):
             # 评估旧动作
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
+            logprobs, state_values, dist_entropy = self.policy.evaluate(
+                old_states, old_actions, self.device
+            )
 
-            # 计算重要性采样比率
+            # 计算比率
             ratios = torch.exp(logprobs - old_logprobs)
 
-            # 计算代理损失
+            # Actor损失
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * dist_entropy.mean()
 
-            # 损失组件
-            policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = self.value_loss_fn(state_values, rewards)
-            entropy_loss = -self.entropy_coef * dist_entropy.mean()
+            # Critic损失 - 使用MSE
+            critic_loss = self.mse_loss(state_values, returns)
 
-            # 总损失
-            total_loss = policy_loss + self.value_coef * value_loss + entropy_loss
+            # 改进5: 分别更新Actor和Critic
+            # 更新Actor
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward(retain_graph=True)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.policy.actor_feature.parameters()) +
+                list(self.policy.actor_head.parameters()),
+                max_norm=0.5
+            )
+            self.actor_optimizer.step()
 
-            # 梯度更新
-            self.optimizer.zero_grad()
-            total_loss.backward()
-
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
-
-            self.optimizer.step()
+            # 更新Critic
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.policy.critic_feature.parameters()) +
+                list(self.policy.critic_head.parameters()),
+                max_norm=0.5
+            )
+            self.critic_optimizer.step()
 
             # 累计损失
-            total_policy_loss += policy_loss.item()
-            total_value_loss += value_loss.item()
-            total_entropy_loss += entropy_loss.item()
+            total_actor_loss += actor_loss.item()
+            total_critic_loss += critic_loss.item()
+            total_entropy += dist_entropy.mean().item()
 
         # 更新学习率
-        avg_value_loss = total_value_loss / self.K_epochs
-        self.scheduler.step(avg_value_loss)
+        self.actor_scheduler.step()
+        self.critic_scheduler.step()
 
         # 更新旧策略
         self.policy_old.load_state_dict(self.policy.state_dict())
@@ -249,7 +305,8 @@ class PPO:
 
         self.update_count += 1
 
-        return (total_policy_loss / self.K_epochs,
-                total_value_loss / self.K_epochs,
-                total_entropy_loss / self.K_epochs)
-
+        return (
+            total_actor_loss / self.K_epochs,
+            total_critic_loss / self.K_epochs,
+            total_entropy / self.K_epochs
+        )
