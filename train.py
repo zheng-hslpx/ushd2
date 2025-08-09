@@ -13,7 +13,7 @@ from utils.evaluation import evaluate_scheduling_result, print_evaluation_report
 import visdom
 import utils.data_generator as data_generator
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+# import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import logging
 
@@ -33,7 +33,7 @@ num_instances = 100  # 增加训练数据多样性
 
 # 训练参数配置
 TRAINING_CONFIG = {
-    'max_episodes': 100,  # 继续训练
+    'max_episodes': 1000,  # 继续训练
     'max_steps_per_episode': num_tasks,
     'early_stop_patience': 300,
     'seed': 42,
@@ -378,9 +378,28 @@ def main():
     # 注意：如果您的PPO类支持分离的学习率，请使用以下参数
     # 如果不支持，请使用单一学习率
     try:
+        # ppo = PPO(
+        #     hgnn=hgnn,
+        #     action_dim=action_dim,
+        #     lr_actor=PPO_CONFIG['lr_actor'],
+        #     lr_critic=PPO_CONFIG['lr_critic'],
+        #     gamma=PPO_CONFIG['gamma'],
+        #     eps_clip=PPO_CONFIG['eps_clip'],
+        #     K_epochs=PPO_CONFIG['K_epochs'],
+        #     device=device,
+        #     entropy_coef=PPO_CONFIG['entropy_coef'],
+        #     value_coef=PPO_CONFIG['value_coef'],
+        #     gae_lambda=PPO_CONFIG.get('gae_lambda', 0.95)
+        # )
+        # 在main函数中实例化PPO时，不需要传递hgnn参数了
         ppo = PPO(
-            hgnn=hgnn,
             action_dim=action_dim,
+            usv_feat_dim=usv_feat_dim,
+            task_feat_dim=task_feat_dim,
+            hidden_dim=HGNN_CONFIG['hidden_dim'],
+            n_heads=HGNN_CONFIG['n_heads'],
+            num_layers=HGNN_CONFIG['num_layers'],
+            dropout=HGNN_CONFIG['dropout'],
             lr_actor=PPO_CONFIG['lr_actor'],
             lr_critic=PPO_CONFIG['lr_critic'],
             gamma=PPO_CONFIG['gamma'],
@@ -391,6 +410,7 @@ def main():
             value_coef=PPO_CONFIG['value_coef'],
             gae_lambda=PPO_CONFIG.get('gae_lambda', 0.95)
         )
+
     except TypeError:
         # 如果不支持分离学习率，使用单一学习率
         print("使用单一学习率配置")
@@ -532,7 +552,7 @@ def main():
         # 定期评估
         if episode % TRAINING_CONFIG['eval_frequency'] == 0 and episode > 0:
             eval_reward, eval_makespan, eval_balance = evaluate_model(
-                ppo, env, train_instances, device, TRAINING_CONFIG
+                ppo, env, train_instances, device, TRAINING_CONFIG, episode
             )
 
             print(f"\n📊 Episode {episode} 评估结果:")
