@@ -42,15 +42,15 @@ class ActorCritic(nn.Module):
     def __init__(self, action_dim, usv_feat_dim, task_feat_dim,
                  hidden_dim=256, n_heads=4, num_layers=2, dropout=0.1, device='cpu'):
         """
-        参数:
-            action_dim: 动作空间维度（usv 数量 * task 数量）
-            usv_feat_dim: USV 节点特征维度
-            task_feat_dim: Task 节点特征维度
-            hidden_dim: GNN 隐藏层维度
-            n_heads: GAT 多头注意力头数
-            num_layers: GNN 层数
-            dropout: Dropout 概率
-            device: 计算设备（'cpu' or 'cuda'）
+               参数:
+                   action_dim: 动作空间维度（usv 数量 * task 数量）
+                   usv_feat_dim: USV 节点特征维度（通常为5: x, y, battery, speed, completion_time）
+                   task_feat_dim: Task 节点特征维度（通常为6）
+                   hidden_dim: GNN 隐藏层维度
+                   n_heads: GAT 多头注意力头数
+                   num_layers: GNN 层数
+                   dropout: Dropout 概率
+                   device: 计算设备（'cpu' or 'cuda'）
         """
         super().__init__()
 

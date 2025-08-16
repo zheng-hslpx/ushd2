@@ -13,7 +13,6 @@ from utils.evaluation import evaluate_scheduling_result, print_evaluation_report
 import visdom
 import utils.data_generator as data_generator
 import matplotlib.pyplot as plt
-# import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import logging
 
@@ -24,51 +23,50 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# ========== 改进的训练配置 ==========
+# ========== 优化的训练配置 ==========
 
 # 环境参数
 num_usvs = 3
 num_tasks = 30
-num_instances = 100  # 增加训练数据多样性
+num_instances = 200  # 增加数据多样性
 
-# 训练参数配置
+# 训练参数配置（优化版）
 TRAINING_CONFIG = {
-    'max_episodes': 1000,  # 继续训练
+    'max_episodes': 2000,  # 增加训练轮数
     'max_steps_per_episode': num_tasks,
-    'early_stop_patience': 300,
+    'early_stop_patience': 500,  # 增加耐心
     'seed': 42,
-    'eta': 7,  # 增加图连接度
-    'warmup_episodes': 200,
-    'eval_frequency': 50,
-    'batch_episodes': 15,  # 增加批次大小
+    'eta': 5,  # 适度的图连接度
+    'warmup_episodes': 100,  # 减少预热期
+    'eval_frequency': 25,  # 更频繁的评估
+    'batch_episodes': 10,  # 适中的批次大小
     'save_frequency': 100,
 
-    # 新增：课程学习参数
-    'curriculum_stages': [
-        {'episodes': 500, 'focus': 'balance'},  # 阶段1：重视均衡
-        {'episodes': 1000, 'focus': 'mixed'},   # 阶段2：平衡
-        {'episodes': 1500, 'focus': 'makespan'} # 阶段3：重视效率
-    ]
+    # 新增：自适应探索策略
+    'exploration_decay_rate': 0.995,
+    'min_exploration_rate': 0.01,
+    'initial_exploration_rate': 0.3,
 }
 
-# HGNN参数配置
+# HGNN参数配置（优化）
 HGNN_CONFIG = {
     'hidden_dim': 256,
     'n_heads': 8,
     'num_layers': 3,
-    'dropout': 0.1,  # 降低dropout
+    'dropout': 0.05,  # 降低dropout
 }
 
-# PPO参数配置（改进版）
+# PPO参数配置（针对makespan优化调整）
 PPO_CONFIG = {
-    'lr_actor': 2e-4,  # 稍微降低学习率
-    'lr_critic': 8e-4,
-    'gamma': 0.995,  # 增加远见
-    'eps_clip': 0.15,  # 更保守的更新
-    'K_epochs': 12,
-    'entropy_coef': 0.008,  # 降低探索
-    'value_coef': 1.2,
-    'gae_lambda': 0.97,
+    'lr_actor': 1e-4,  # 降低学习率，更稳定
+    'lr_critic': 5e-4,
+    'gamma': 0.99,  # 增加远见
+    'eps_clip': 0.2,  # 标准值
+    'K_epochs': 20,  # 增加更新次数  15
+    'batch_episodes': 20,  # 增加批次大小（原来是10）
+    'entropy_coef': 0.005,  # 降低探索噪声
+    'value_coef': 1.0,
+    'gae_lambda': 0.98,  # 增加优势估计的准确性
 }
 
 
@@ -81,32 +79,36 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
 
 
-def adaptive_exploration(action, action_mask, episode, usv_completion_times):
-    """基于USV完成时间的自适应探索"""
-    explore_prob = max(0.02, 0.2 * (0.997 ** episode))
-
-    if np.random.random() < explore_prob:
+def makespan_aware_exploration(action, action_mask, episode, env, exploration_rate):
+    """
+    基于Makespan的智能探索策略
+    优先选择当前完成时间最早的USV
+    """
+    if np.random.random() < exploration_rate:
         valid_actions = np.where(action_mask)[0]
         if len(valid_actions) == 0:
             return action
 
-        # 基于USV当前完成时间分配概率
-        action_probs = np.ones(len(valid_actions))
+        # 获取每个有效动作对应的USV
+        action_scores = np.zeros(len(valid_actions))
 
         for i, valid_action in enumerate(valid_actions):
             usv_idx = valid_action // 30
-            # 完成时间越早的USV，被选择概率越高
-            completion_time_ranks = np.argsort(usv_completion_times)
-            rank = np.where(completion_time_ranks == usv_idx)[0][0]
-            action_probs[i] = 1.0 / (1.0 + rank)
+            # 当前完成时间越早的USV，被选择概率越高
+            completion_time = env.usv_next_available_time[usv_idx]
+            # 使用倒数作为得分（完成时间越小，得分越高）
+            action_scores[i] = 1.0 / (1.0 + completion_time)
 
-        action_probs = action_probs / np.sum(action_probs)
+        # 归一化为概率
+        action_probs = action_scores / np.sum(action_scores)
+
+        # 按概率选择动作
         return np.random.choice(valid_actions, p=action_probs)
 
     return action
 
 
-def collect_batch_episodes(env, ppo, instances, batch_size, device, config, episode_num):
+def collect_batch_episodes(env, ppo, instances, batch_size, device, config, episode_num, exploration_rate):
     """
     批量收集多个episode的经验
     """
@@ -127,8 +129,8 @@ def collect_batch_episodes(env, ppo, instances, batch_size, device, config, epis
         steps = 0
         done = False
 
-        # 跟踪USV任务分配
-        usv_task_counts = np.zeros(env.num_usvs)
+        # 记录每步的makespan变化
+        makespan_trajectory = []
 
         while not done and steps < config['max_steps_per_episode']:
             # 构建图
@@ -144,18 +146,17 @@ def collect_batch_episodes(env, ppo, instances, batch_size, device, config, epis
             # 选择动作
             action, log_prob, state_value = ppo.select_action(graph)
 
-            # 智能探索（考虑负载均衡）
-            action = adaptive_exploration(
+            # 智能探索（基于makespan）
+            action = makespan_aware_exploration(
                 action, state['action_mask'],
-                episode_num, usv_task_counts
+                episode_num, env, exploration_rate
             )
 
             # 执行动作
             next_state, reward, done, info = env.step(action)
 
-            # 更新USV任务计数
-            usv_idx = action // num_tasks
-            usv_task_counts[usv_idx] += 1
+            # 记录makespan变化
+            makespan_trajectory.append(info['makespan'])
 
             # 存储经验
             batch_memory.states.append(graph)
@@ -170,11 +171,14 @@ def collect_batch_episodes(env, ppo, instances, batch_size, device, config, epis
             steps += 1
 
         # 计算负载均衡度
-        final_task_counts = np.bincount(
-            env.task_assignment[env.task_assignment != -1],
-            minlength=env.num_usvs
-        )
-        balance_std = np.std(final_task_counts)
+        if env.task_assignment is not None:
+            final_task_counts = np.bincount(
+                env.task_assignment[env.task_assignment != -1],
+                minlength=env.num_usvs
+            )
+            balance_std = np.std(final_task_counts)
+        else:
+            balance_std = float('inf')
 
         batch_rewards.append(episode_reward)
         batch_makespans.append(info.get('final_makespan', float('inf')))
@@ -194,7 +198,7 @@ def evaluate_model(ppo, env, test_instances, device, config, episode):
     ppo.policy_old.eval()  # 设置为评估模式
 
     with torch.no_grad():
-        for tasks, usvs in test_instances[:10]:  # 评估10个实例
+        for tasks, usvs in test_instances[:20]:  # 评估20个实例
             state = env.reset_with_instances(tasks, usvs)
 
             episode_reward = 0
@@ -212,30 +216,26 @@ def evaluate_model(ppo, env, test_instances, device, config, episode):
                 )
                 graph.action_mask = state['action_mask']
 
-                # 选择动作
-                action, log_prob, state_value = ppo.select_action(graph)
-
-                # 获取USV完成时间用于探索
-                usv_completion_times = env.usv_next_available_time.copy()
-
-                # 智能探索（基于USV完成时间）
-                action = adaptive_exploration(
-                    action, state['action_mask'],
-                    episode, usv_completion_times
-                )
+                # 选择动作（评估时不探索）
+                action, _, _ = ppo.select_action(graph)
 
                 # 执行动作
                 next_state, reward, done, info = env.step(action)
 
+                state = next_state
+                episode_reward += reward
+                steps += 1
+
             # 计算负载均衡
-            task_counts = np.bincount(
-                env.task_assignment[env.task_assignment != -1],
-                minlength=env.num_usvs
-            )
+            if env.task_assignment is not None:
+                task_counts = np.bincount(
+                    env.task_assignment[env.task_assignment != -1],
+                    minlength=env.num_usvs
+                )
+                load_balances.append(np.std(task_counts))
 
             total_rewards.append(episode_reward)
             total_makespans.append(info.get('final_makespan', float('inf')))
-            load_balances.append(np.std(task_counts))
 
     ppo.policy_old.train()  # 恢复训练模式
 
@@ -250,22 +250,22 @@ def generate_gantt_chart(env, save_path=None):
 
     fig, ax = plt.subplots(figsize=(15, 8))
 
-    # 为每个 USV 生成唯一颜色
+    # 为每个USV生成唯一颜色
     num_usvs = env.num_usvs
     hues = np.linspace(0, 1, num_usvs, endpoint=False)
     usv_colors_list = [mcolors.hsv_to_rgb((h, 0.8, 0.8)) for h in hues]
 
-    # 用于存储每个 USV 的任务及其时间信息
+    # 用于存储每个USV的任务及其时间信息
     usv_task_data = {i: [] for i in range(env.num_usvs)}
 
-    # 填充 usv_task_data
+    # 填充usv_task_data
     for task_idx in env.scheduled_tasks:
         if task_idx in env.task_schedule_details:
             details = env.task_schedule_details[task_idx]
             usv_idx = details['usv_idx']
             usv_task_data[usv_idx].append(details)
 
-    # 对每个 USV 上的任务按处理开始时间排序
+    # 对每个USV上的任务按处理开始时间排序
     for usv_idx in usv_task_data:
         if usv_task_data[usv_idx]:
             usv_task_data[usv_idx].sort(key=lambda x: x['processing_start_time'])
@@ -311,7 +311,7 @@ def generate_gantt_chart(env, save_path=None):
     ax.set_yticklabels(y_labels)
     ax.set_xlabel('Time')
     ax.set_ylabel('USV')
-    ax.set_title('Gantt Chart of USV Task Scheduling')
+    ax.set_title('Gantt Chart of USV Task Scheduling (Optimized)')
 
     # 添加图例
     from matplotlib.patches import Patch
@@ -323,7 +323,8 @@ def generate_gantt_chart(env, save_path=None):
         env.task_assignment[env.task_assignment != -1],
         minlength=env.num_usvs
     )
-    stats_text = f"Task Distribution: {task_counts} | Std: {np.std(task_counts):.2f}"
+    makespan = env.current_makespan
+    stats_text = f"Makespan: {makespan:.1f} | Task Distribution: {task_counts} | Std: {np.std(task_counts):.2f}"
     ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
             fontsize=10, verticalalignment='top',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
@@ -364,78 +365,35 @@ def main():
 
     print(f"特征维度 - USV: {usv_feat_dim}, Task: {task_feat_dim}, Action: {action_dim}")
 
-    # 初始化HGNN模型
-    hgnn = StableUSVHeteroGNN(
+    # 初始化PPO
+    ppo = PPO(
+        action_dim=action_dim,
         usv_feat_dim=usv_feat_dim,
         task_feat_dim=task_feat_dim,
         hidden_dim=HGNN_CONFIG['hidden_dim'],
         n_heads=HGNN_CONFIG['n_heads'],
         num_layers=HGNN_CONFIG['num_layers'],
-        dropout=HGNN_CONFIG['dropout']
-    ).to(device)
-
-    # 初始化PPO
-    # 注意：如果您的PPO类支持分离的学习率，请使用以下参数
-    # 如果不支持，请使用单一学习率
-    try:
-        # ppo = PPO(
-        #     hgnn=hgnn,
-        #     action_dim=action_dim,
-        #     lr_actor=PPO_CONFIG['lr_actor'],
-        #     lr_critic=PPO_CONFIG['lr_critic'],
-        #     gamma=PPO_CONFIG['gamma'],
-        #     eps_clip=PPO_CONFIG['eps_clip'],
-        #     K_epochs=PPO_CONFIG['K_epochs'],
-        #     device=device,
-        #     entropy_coef=PPO_CONFIG['entropy_coef'],
-        #     value_coef=PPO_CONFIG['value_coef'],
-        #     gae_lambda=PPO_CONFIG.get('gae_lambda', 0.95)
-        # )
-        # 在main函数中实例化PPO时，不需要传递hgnn参数了
-        ppo = PPO(
-            action_dim=action_dim,
-            usv_feat_dim=usv_feat_dim,
-            task_feat_dim=task_feat_dim,
-            hidden_dim=HGNN_CONFIG['hidden_dim'],
-            n_heads=HGNN_CONFIG['n_heads'],
-            num_layers=HGNN_CONFIG['num_layers'],
-            dropout=HGNN_CONFIG['dropout'],
-            lr_actor=PPO_CONFIG['lr_actor'],
-            lr_critic=PPO_CONFIG['lr_critic'],
-            gamma=PPO_CONFIG['gamma'],
-            eps_clip=PPO_CONFIG['eps_clip'],
-            K_epochs=PPO_CONFIG['K_epochs'],
-            device=device,
-            entropy_coef=PPO_CONFIG['entropy_coef'],
-            value_coef=PPO_CONFIG['value_coef'],
-            gae_lambda=PPO_CONFIG.get('gae_lambda', 0.95)
-        )
-
-    except TypeError:
-        # 如果不支持分离学习率，使用单一学习率
-        print("使用单一学习率配置")
-        ppo = PPO(
-            hgnn=hgnn,
-            action_dim=action_dim,
-            lr=PPO_CONFIG['lr_actor'],
-            gamma=PPO_CONFIG['gamma'],
-            eps_clip=PPO_CONFIG['eps_clip'],
-            K_epochs=PPO_CONFIG['K_epochs'],
-            device=device,
-            entropy_coef=PPO_CONFIG['entropy_coef'],
-            value_coef=PPO_CONFIG['value_coef']
-        )
+        dropout=HGNN_CONFIG['dropout'],
+        lr_actor=PPO_CONFIG['lr_actor'],
+        lr_critic=PPO_CONFIG['lr_critic'],
+        gamma=PPO_CONFIG['gamma'],
+        eps_clip=PPO_CONFIG['eps_clip'],
+        K_epochs=PPO_CONFIG['K_epochs'],
+        device=device,
+        entropy_coef=PPO_CONFIG['entropy_coef'],
+        value_coef=PPO_CONFIG['value_coef'],
+        gae_lambda=PPO_CONFIG['gae_lambda']
+    )
 
     # 初始化TensorBoard
-    writer = SummaryWriter(f"runs/usv_scheduling_{time.strftime('%Y%m%d_%H%M%S')}")
+    writer = SummaryWriter(f"runs/usv_scheduling_makespan_{time.strftime('%Y%m%d_%H%M%S')}")
 
-    # 初始化Visdom（可选）
+    # 初始化Visdom
     vis = None
     try:
         vis = visdom.Visdom()
         if vis.check_connection():
             print("Visdom连接成功")
-            # 初始化可视化窗口
             vis_windows = {
                 'reward': vis.line(Y=torch.zeros((1)).cpu(), X=torch.zeros((1)).cpu(),
                                    opts=dict(xlabel='Episode', ylabel='Reward', title='Training Reward')),
@@ -448,10 +406,8 @@ def main():
                                              legend=['Policy', 'Value']))
             }
         else:
-            print("Visdom未连接，将跳过可视化")
             vis = None
-    except Exception as e:
-        print(f"Visdom初始化失败: {e}")
+    except:
         vis = None
 
     # 生成训练数据
@@ -471,33 +427,38 @@ def main():
     best_balance = float('inf')
     no_improve_count = 0
 
+    # 探索率
+    exploration_rate = TRAINING_CONFIG['initial_exploration_rate']
+
     print("\n" + "=" * 60)
-    print("🚀 开始训练")
+    print("🚀 开始训练 (Makespan优化版)")
     print("=" * 60)
 
     episode = 0
     pbar = tqdm(total=TRAINING_CONFIG['max_episodes'], desc="训练进度")
 
     while episode < TRAINING_CONFIG['max_episodes']:
+        # 更新探索率
+        exploration_rate = max(
+            TRAINING_CONFIG['min_exploration_rate'],
+            exploration_rate * TRAINING_CONFIG['exploration_decay_rate']
+        )
+
         # 批量收集经验
         batch_memory, batch_rewards, batch_makespans, batch_balances = collect_batch_episodes(
             env, ppo, train_instances,
             TRAINING_CONFIG['batch_episodes'],
-            device, TRAINING_CONFIG, episode
+            device, TRAINING_CONFIG, episode, exploration_rate
         )
-        episode += TRAINING_CONFIG['batch_episodes']
 
         # 更新PPO
         if len(batch_memory.states) > 0:
-            # 根据您的PPO实现选择正确的返回值
             losses = ppo.update(batch_memory)
             if isinstance(losses, tuple) and len(losses) >= 2:
                 policy_loss, value_loss = losses[0], losses[1]
                 entropy_loss = losses[2] if len(losses) > 2 else 0
             else:
                 policy_loss = value_loss = entropy_loss = 0
-        else:
-            policy_loss = value_loss = entropy_loss = 0
 
         # 更新统计
         all_rewards.extend(batch_rewards)
@@ -523,6 +484,7 @@ def main():
         writer.add_scalar("Loss/Policy", policy_loss, episode)
         writer.add_scalar("Loss/Value", value_loss, episode)
         writer.add_scalar("Loss/Entropy", entropy_loss, episode)
+        writer.add_scalar("Exploration/Rate", exploration_rate, episode)
 
         # 更新Visdom
         if vis and 'reward' in vis_windows:
@@ -545,8 +507,7 @@ def main():
             'R': f"{avg_reward:.1f}",
             'M': f"{avg_makespan:.1f}",
             'B': f"{avg_balance:.2f}",
-            'PL': f"{policy_loss:.3f}",
-            'VL': f"{value_loss:.3f}"
+            'Exp': f"{exploration_rate:.3f}"
         })
 
         # 定期评估
@@ -559,9 +520,10 @@ def main():
             print(f"  平均奖励: {eval_reward:.2f}")
             print(f"  平均Makespan: {eval_makespan:.2f}")
             print(f"  负载均衡度(std): {eval_balance:.2f}")
+            print(f"  探索率: {exploration_rate:.3f}")
 
-            # 保存最佳模型
-            if eval_reward > best_avg_reward and eval_balance < 3.0:  # 确保负载均衡
+            # 保存最佳模型（主要关注makespan）
+            if eval_makespan < best_avg_makespan:
                 best_avg_reward = eval_reward
                 best_avg_makespan = eval_makespan
                 best_balance = eval_balance
@@ -569,7 +531,6 @@ def main():
 
                 torch.save({
                     'model_state_dict': ppo.policy.state_dict(),
-                    'optimizer_state_dict': ppo.optimizer.state_dict() if hasattr(ppo, 'optimizer') else None,
                     'episode': episode,
                     'avg_reward': best_avg_reward,
                     'avg_makespan': best_avg_makespan,
@@ -580,7 +541,7 @@ def main():
                         'training': TRAINING_CONFIG
                     }
                 }, f'{model_dir}/best_model.pt')
-                print(f"  ✅ 保存最佳模型")
+                print(f"  ✅ 保存最佳模型 (Makespan: {best_avg_makespan:.2f})")
             else:
                 no_improve_count += 1
 
@@ -588,7 +549,6 @@ def main():
         if episode % TRAINING_CONFIG['save_frequency'] == 0 and episode > 0:
             torch.save({
                 'model_state_dict': ppo.policy.state_dict(),
-                'optimizer_state_dict': ppo.optimizer.state_dict() if hasattr(ppo, 'optimizer') else None,
                 'episode': episode,
                 'all_rewards': all_rewards[-100:],
                 'all_makespans': all_makespans[-100:],
@@ -640,11 +600,11 @@ def main():
             steps += 1
 
         # 生成甘特图
-        generate_gantt_chart(env, save_path=f'{model_dir}/final_gantt.png')
+        generate_gantt_chart(env, save_path=f'{model_dir}/final_gantt_optimized.png')
 
         # 打印最终评估报告
         eval_result = evaluate_scheduling_result(env)
-        print_evaluation_report(eval_result, "Final PPO Model")
+        print_evaluation_report(eval_result, "Optimized PPO Model")
 
     except Exception as e:
         print(f"生成甘特图时出错: {e}")
