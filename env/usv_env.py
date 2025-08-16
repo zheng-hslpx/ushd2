@@ -7,12 +7,11 @@ import logging
 
 class USVSchedulingEnv(gym.Env):
     """
-    优化后的USV调度环境
+    优化后的USV调度环境 - 以Makespan优化为核心
     主要改进：
-    1. 简化奖励函数
-    2. 优化动作掩码逻辑
-    3. 清理冗余代码
-    4. 增强错误处理
+    1. 简化奖励函数为makespan差值
+    2. 添加辅助引导机制
+    3. 优化动作选择策略
     """
 
     def __init__(self, num_usvs=3, num_tasks=30, area_size_x=(0, 500), area_size_y=(0, 500),
@@ -29,37 +28,31 @@ class USVSchedulingEnv(gym.Env):
         self.battery_capacity = battery_capacity
         self.speed_range = speed_range
         self.charge_time = charge_time
-        # ========== 添加这一行 ==========
-        self.debug_mode = True  # 或者 True，根据你是否需要调试输出
-        # =============================
-        self.charging_penalty = 0  # 初始化充电惩罚
+        self.debug_mode = True
+        self.charging_penalty = 0
 
         # 定义观测空间和动作空间
         self.observation_space = spaces.Dict({
-            'usv_features': spaces.Box(low=0, high=1, shape=(num_usvs, 4)),  # [x, y, battery, speed]
-            'task_features': spaces.Box(low=0, high=100, shape=(num_tasks, 6)),  # [x, y, t1, t2, t3, is_pending]
-            'edge_features': spaces.Box(low=0, high=100, shape=(num_usvs, num_tasks)),  # 距离矩阵
+            'usv_features': spaces.Box(low=0, high=1, shape=(num_usvs, 4)),
+            'task_features': spaces.Box(low=0, high=100, shape=(num_tasks, 6)),
+            'edge_features': spaces.Box(low=0, high=100, shape=(num_usvs, num_tasks)),
             'action_mask': spaces.Box(low=0, high=1, shape=(num_usvs * num_tasks,), dtype=np.bool_)
         })
 
         self.action_space = spaces.Discrete(num_usvs * num_tasks)
 
-        # 奖励参数 - 简化为makespan奖励
-        self.reward_config = {
-            'use_simple_makespan_reward': True,  # 使用简单的makespan奖励
-            # 备用：如果需要可以添加其他奖励组件
-            # 'completion_bonus': 10.0,
-            # 'efficiency_weight': 0.1,
-        }
-
         # 初始化状态变量
-        self.tasks = None  # 将由reset或reset_with_instances设置
-        self.usvs = None  # 将由reset或reset_with_instances设置
+        self.tasks = None
+        self.usvs = None
         self._initialize_state_variables()
 
+        # 新增：makespan跟踪变量
+        self.last_makespan = 0.0
+        self.current_makespan = 0.0
+        self.initial_makespan_estimate = 0.0
+
     def _initialize_state_variables(self):
-        """初始化状态变量（不包括tasks和usvs，它们由外部设置）"""
-        # 注意：不重置 self.tasks 和 self.usvs，它们由reset_with_instances设置
+        """初始化状态变量"""
         self.scheduled_tasks = []
         self.current_time = 0.0
         self.usv_positions = np.zeros((self.num_usvs, 2))
@@ -69,11 +62,13 @@ class USVSchedulingEnv(gym.Env):
         self.makespan_batch = np.zeros(self.num_tasks)
         self.task_assignment = np.full(self.num_tasks, -1, dtype=int)
         self.task_schedule_details = {}
+
+        # 重置makespan跟踪
         self.last_makespan = 0.0
+        self.current_makespan = 0.0
 
     def reset(self):
         """重置环境为初始状态"""
-        # 生成默认任务和USV数据
         default_tasks, default_usvs = generate_task_instance(
             num_tasks=self.num_tasks,
             num_usvs=self.num_usvs,
@@ -97,22 +92,41 @@ class USVSchedulingEnv(gym.Env):
         # 设置USV速度
         self._setup_usv_speeds(usvs['speed'])
 
+        # 估算初始makespan（用于归一化）
+        self._estimate_initial_makespan()
+
         return self._get_observation()
 
     def _setup_usv_speeds(self, speed_data):
-        """设置USV速度，处理长度不匹配的情况"""
+        """设置USV速度"""
         speed_array = np.array(speed_data)
 
         if len(speed_array) >= self.num_usvs:
             self.usv_speeds = speed_array[:self.num_usvs]
         else:
-            # 用平均速度填充不足的部分
             default_speed = np.mean(self.speed_range)
             self.usv_speeds = np.pad(
                 speed_array,
                 (0, self.num_usvs - len(speed_array)),
                 constant_values=default_speed
             )
+
+    def _estimate_initial_makespan(self):
+        """估算理论最小makespan用于归一化"""
+        # 计算所有任务的总处理时间
+        total_processing_time = 0
+        for task_idx in range(self.num_tasks):
+            proc_time = self._get_processing_time(task_idx)
+            total_processing_time += proc_time
+
+        # 理论最小makespan（完美均衡情况）
+        avg_speed = np.mean(self.usv_speeds)
+        avg_distance = np.sqrt((self.area_size_x[1] ** 2 + self.area_size_y[1] ** 2)) / 4  # 估算平均距离
+        avg_travel_time = avg_distance / avg_speed
+
+        # 每个USV的理想工作时间
+        ideal_work_per_usv = (total_processing_time + self.num_tasks * avg_travel_time) / self.num_usvs
+        self.initial_makespan_estimate = ideal_work_per_usv
 
     def step(self, action):
         """执行动作并更新环境状态"""
@@ -144,11 +158,9 @@ class USVSchedulingEnv(gym.Env):
         """检查动作是否有效"""
         usv_idx, task_idx = self._parse_action(action)
 
-        # 检查索引范围
         if usv_idx >= self.num_usvs or task_idx >= self.num_tasks:
             return False
 
-        # 检查任务是否已调度
         if task_idx in self.scheduled_tasks:
             return False
 
@@ -157,11 +169,14 @@ class USVSchedulingEnv(gym.Env):
     def _handle_invalid_action(self, action):
         """处理无效动作"""
         logging.warning(f"无效动作: {action}")
-        # 返回惩罚奖励，不改变状态
-        return self._get_observation(), -100.0, False, {'invalid_action': True}
+        # 无效动作给予强惩罚
+        return self._get_observation(), -1000.0, False, {'invalid_action': True}
 
     def _execute_scheduling(self, usv_idx, task_idx):
         """执行调度逻辑"""
+        # 保存上一步的makespan
+        self.last_makespan = self.current_makespan
+
         # 获取位置和时间信息
         usv_pos = self.usv_positions[usv_idx]
         task_pos = self.tasks['coords'][task_idx]
@@ -185,8 +200,11 @@ class USVSchedulingEnv(gym.Env):
         self._record_task_assignment(task_idx, usv_idx, travel_start_time,
                                      travel_time, processing_start_time, processing_time)
 
+        # 更新当前makespan
+        self.current_makespan = np.max(self.usv_next_available_time)
+
         # 计算奖励
-        reward = self._calculate_reward(usv_idx, task_idx, distance, processing_time)
+        reward = self._calculate_reward(usv_idx, task_idx)
 
         return reward
 
@@ -198,30 +216,21 @@ class USVSchedulingEnv(gym.Env):
         return proc_time_data
 
     def _update_usv_state(self, usv_idx, new_position, distance, end_time):
-        """改进的USV状态更新，包含电池管理"""
+        """更新USV状态"""
         # 更新位置
         self.usv_positions[usv_idx] = new_position
 
-        # 改进的电量消耗模型
-        base_consumption = distance * 0.1
-        speed_factor = self.usv_speeds[usv_idx] / np.mean(self.speed_range)
-        battery_consumption = base_consumption * speed_factor
-
+        # 简化的电量消耗模型
+        battery_consumption = distance * 0.1
         new_battery = self.usv_batteries[usv_idx] - battery_consumption
 
-        # 电池管理策略
-        if new_battery < 20:  # 低电量
-            # 添加充电时间
-            charge_needed = self.battery_capacity - new_battery
-            charge_time = charge_needed * self.charge_time / 100
+        # 电池管理
+        if new_battery < 20:
+            charge_time = (self.battery_capacity - new_battery) * self.charge_time / 100
             end_time += charge_time
             self.usv_batteries[usv_idx] = self.battery_capacity
-
-            # 在奖励中体现充电成本
-            self.charging_penalty = -charge_time * 0.5  # 存储充电惩罚
         else:
             self.usv_batteries[usv_idx] = new_battery
-            self.charging_penalty = 0
 
         # 更新可用时间
         self.usv_next_available_time[usv_idx] = end_time
@@ -232,15 +241,12 @@ class USVSchedulingEnv(gym.Env):
     def _record_task_assignment(self, task_idx, usv_idx, travel_start, travel_time,
                                 processing_start, processing_time):
         """记录任务分配详情"""
-        # 更新分配记录
         self.task_assignment[task_idx] = usv_idx
         self.scheduled_tasks.append(task_idx)
 
-        # 更新完成时间
         completion_time = processing_start + processing_time
         self.makespan_batch[task_idx] = completion_time
 
-        # 记录详细信息
         self.task_schedule_details[task_idx] = {
             'task_idx': task_idx,
             'usv_idx': usv_idx,
@@ -250,140 +256,134 @@ class USVSchedulingEnv(gym.Env):
             'processing_time': processing_time
         }
 
-        logging.debug(f"任务 {task_idx} 分配给 USV {usv_idx}, 完成时间: {completion_time:.2f}")
-
-
-    def _calculate_reward(self, usv_idx, task_idx, distance, processing_time):
+    def _calculate_reward(self, usv_idx, task_idx):
         """
-        进一步优化的奖励函数
-        在保持负载均衡的基础上，更注重降低makespan
+        简化的奖励函数 - 以makespan优化为核心
         """
-        # 初始化总奖励变量
-        total_reward = 0
+        # ========== 核心奖励：Makespan改进 ==========
+        makespan_improvement = self.last_makespan - self.current_makespan
 
-        # ========== 基础组件 ==========
-        base_completion_reward = 10.0  # 降低基础奖励
-
-        # ========== 负载均衡（保持现有的良好效果）==========
-        task_counts = np.zeros(self.num_usvs)
-        work_times = np.zeros(self.num_usvs)
-
-        for assigned_task in self.scheduled_tasks:
-            assigned_usv = self.task_assignment[assigned_task]
-            if assigned_usv != -1:
-                task_counts[assigned_usv] += 1
-                if assigned_task in self.task_schedule_details:
-                    details = self.task_schedule_details[assigned_task]
-                    work_times[assigned_usv] += (details['travel_time'] + details['processing_time'])
-
-        # 预计算当前任务的影响
-        task_counts[usv_idx] += 1
-        estimated_time = distance / self.usv_speeds[usv_idx] + processing_time
-        work_times[usv_idx] += estimated_time
-
-        # 任务数量均衡奖励（保持）
-        task_std = np.std(task_counts)
-        task_balance_reward = 30.0 * np.exp(-task_std)  # 指数衰减奖励
-
-        # ========== 新增：时间均衡奖励 ==========
-        time_std = np.std(work_times)
-        time_balance_reward = 20.0 * np.exp(-time_std / 100)  # 归一化后的指数奖励
-
-        # ========== 核心改进：Makespan优化 ==========
-
-        # 当前所有USV的完成时间
-        current_completion_times = self.usv_next_available_time.copy()
-        current_completion_times[usv_idx] += estimated_time
-
-        # 新的makespan
-        new_makespan = np.max(current_completion_times)
-        old_makespan = np.max(self.usv_next_available_time)
-
-        # Makespan增量惩罚（更严格）
-        makespan_increase = new_makespan - old_makespan
-        if makespan_increase <= 0:
-            makespan_reward = 50.0  # 不增加makespan，大奖励
-        elif makespan_increase < 50:
-            makespan_reward = 20.0 - 0.5 * makespan_increase  # 小幅增加，轻微惩罚
+        # 基础奖励：makespan差值
+        if len(self.scheduled_tasks) == 1:
+            # 第一个任务，给予小奖励鼓励开始
+            base_reward = 10.0
         else:
-            makespan_reward = -0.8 * makespan_increase  # 大幅增加，严重惩罚
+            # makespan改进奖励（放大信号）
+            if makespan_improvement > 0:
+                # Makespan减少（理论上不应该发生，但如果发生给予大奖励）
+                base_reward = 100.0 * makespan_improvement
+            elif makespan_improvement == 0:
+                # Makespan没有增加（选择了当前最空闲的USV）
+                base_reward = 50.0
+            else:
+                # Makespan增加（根据增加量给予惩罚）
+                makespan_increase = -makespan_improvement
+                if makespan_increase < 50:
+                    base_reward = -0.5 * makespan_increase  # 小幅增加，轻微惩罚
+                elif makespan_increase < 100:
+                    base_reward = -1.0 * makespan_increase  # 中等增加，中等惩罚
+                else:
+                    base_reward = -2.0 * makespan_increase  # 大幅增加，重度惩罚
 
-        # ========== 新增：选择空闲USV的奖励 ==========
+        # ========== 辅助奖励1：选择最优USV ==========
         # 鼓励选择当前完成时间最早的USV
-        usv_rank = np.argsort(self.usv_next_available_time)
-        if usv_idx == usv_rank[0]:  # 选择了最空闲的USV
-            idle_bonus = 30.0
-        elif usv_idx == usv_rank[1] and len(usv_rank) > 1:
-            idle_bonus = 10.0
+        usv_completion_times = self.usv_next_available_time.copy()
+        min_completion_usv = np.argmin(usv_completion_times)
+
+        if usv_idx == min_completion_usv:
+            usv_selection_bonus = 30.0  # 选择了最优USV
         else:
-            idle_bonus = -10.0  # 选择了最忙的USV，轻微惩罚
+            # 根据选择的USV排名给予惩罚
+            sorted_indices = np.argsort(usv_completion_times)
+            rank = np.where(sorted_indices == usv_idx)[0][0]
+            usv_selection_bonus = -10.0 * rank  # 排名越靠后，惩罚越大
 
-        # ========== 效率奖励 ==========
-        # 距离效率
-        max_distance = np.sqrt(500 ** 2 + 500 ** 2)
-        distance_reward = 15.0 * (1.0 - distance / max_distance)
-
-        # 时间效率
-        time_efficiency = 10.0 * (1.0 - processing_time / 90.0)
-
-        # ========== 进度自适应权重 ==========
+        # ========== 辅助奖励2：负载均衡 ==========
+        # 只在后期考虑负载均衡
         progress = len(self.scheduled_tasks) / self.num_tasks
 
-        if progress < 0.3:
-            # 早期：重视均衡
-            balance_weight = 1.5
-            makespan_weight = 0.5
-        elif progress < 0.7:
-            # 中期：平衡
-            balance_weight = 1.0
-            makespan_weight = 1.0
+        if progress > 0.7:  # 后期才考虑均衡
+            task_counts = np.bincount(
+                self.task_assignment[self.task_assignment != -1],
+                minlength=self.num_usvs
+            )
+            task_std = np.std(task_counts)
+
+            if task_std < 1.5:
+                balance_bonus = 20.0
+            elif task_std < 2.5:
+                balance_bonus = 0.0
+            else:
+                balance_bonus = -20.0 * (task_std - 2.5)
         else:
-            # 后期：重视效率
-            balance_weight = 0.5
-            makespan_weight = 1.5
+            balance_bonus = 0.0
 
-        # 在计算总奖励之前添加：
-        if hasattr(self, 'charging_penalty'):
-            total_reward += self.charging_penalty
+        # ========== 辅助奖励3：效率奖励 ==========
+        # 距离效率（鼓励选择近的任务）
+        all_distances = []
+        for i in range(self.num_usvs):
+            for j in range(self.num_tasks):
+                if j not in self.scheduled_tasks:
+                    dist = np.linalg.norm(self.usv_positions[i] - self.tasks['coords'][j])
+                    all_distances.append(dist)
 
-        # ========== 总奖励 ==========
-        total_reward = (
-                base_completion_reward +
-                task_balance_reward * balance_weight +
-                time_balance_reward * balance_weight +
-                makespan_reward * makespan_weight +
-                idle_bonus +
-                distance_reward +
-                time_efficiency
-        )
+        if all_distances:
+            current_distance = np.linalg.norm(self.usv_positions[usv_idx] - self.tasks['coords'][task_idx])
+            min_distance = min(all_distances)
 
-        # 调试信息（可选）
-        # if self.debug_mode and len(self.scheduled_tasks) % 10 == 0:
-        #     print(f"\n奖励分解 (任务{task_idx} -> USV{usv_idx}):")
-        #     print(f"  基础完成: {base_completion_reward:.1f}")
-        #     print(f"  负载均衡: {load_balance_reward * balance_weight:.1f}")
-        #     print(f"  距离效率: {distance_reward:.1f}")
-        #     print(f"  时间效率: {time_efficiency_reward:.1f}")
-        #     print(f"  Makespan均衡: {makespan_balance_reward:.1f}")
-        #     print(f"  进度奖励: {progress_reward:.1f}")
-        #     print(f"  当前任务分配: {task_counts}")
-        #     print(f"  总奖励: {total_reward:.1f}")
+            if current_distance <= min_distance * 1.2:  # 选择了较近的任务
+                distance_bonus = 10.0
+            else:
+                distance_bonus = -5.0 * (current_distance / min_distance - 1.2)
+        else:
+            distance_bonus = 0.0
 
-        # 最终任务特殊奖励
-        if len(self.scheduled_tasks) == self.num_tasks - 1:
-            if task_std < 1.0 and new_makespan < 2000:
-                total_reward += 500.0  # 优秀表现
-            elif task_std < 2.0 and new_makespan < 2500:
-                total_reward += 200.0  # 良好表现
+        # ========== 最终任务奖励 ==========
+        if len(self.scheduled_tasks) == self.num_tasks:
+            # 完成所有任务
+            final_makespan = self.current_makespan
 
-        return np.clip(total_reward, -200, 500)
+            if final_makespan < self.initial_makespan_estimate * 1.5:
+                completion_bonus = 500.0  # 优秀完成
+            elif final_makespan < self.initial_makespan_estimate * 2.0:
+                completion_bonus = 200.0  # 良好完成
+            else:
+                completion_bonus = 50.0  # 一般完成
+
+            # 负载均衡奖励
+            final_task_counts = np.bincount(
+                self.task_assignment[self.task_assignment != -1],
+                minlength=self.num_usvs
+            )
+            final_std = np.std(final_task_counts)
+
+            if final_std < 1.0:
+                completion_bonus += 200.0  # 极好的均衡
+            elif final_std < 2.0:
+                completion_bonus += 100.0  # 良好的均衡
+        else:
+            completion_bonus = 0.0
+
+        # ========== 计算总奖励 ==========
+        total_reward = base_reward + usv_selection_bonus + balance_bonus + distance_bonus + completion_bonus
+
+        # 调试输出（每5个任务输出一次）
+        if self.debug_mode and len(self.scheduled_tasks) % 5 == 0:
+            print(f"\n📊 任务{task_idx} -> USV{usv_idx} (第{len(self.scheduled_tasks)}个任务)")
+            print(f"  Makespan: {self.last_makespan:.1f} -> {self.current_makespan:.1f}")
+            print(f"  基础奖励: {base_reward:.1f}")
+            print(f"  USV选择: {usv_selection_bonus:.1f}")
+            print(f"  均衡奖励: {balance_bonus:.1f}")
+            print(f"  距离奖励: {distance_bonus:.1f}")
+            print(f"  总奖励: {total_reward:.1f}")
+            print(f"  USV完成时间: {self.usv_next_available_time}")
+
+        return total_reward
 
     def _generate_info(self, usv_idx, task_idx, done):
         """生成信息字典"""
-        current_makespan = np.max(self.usv_next_available_time)
-
         info = {
-            'makespan': current_makespan,
+            'makespan': self.current_makespan,
             'scheduled_tasks_count': len(self.scheduled_tasks),
             'usv_battery': self.usv_batteries[usv_idx],
             'action_taken': usv_idx * self.num_tasks + task_idx,
@@ -398,16 +398,9 @@ class USVSchedulingEnv(gym.Env):
 
     def _get_observation(self):
         """生成环境观测值"""
-        # USV特征
         usv_features = self._get_usv_features()
-
-        # 任务特征
         task_features = self._get_task_features()
-
-        # 距离特征
         edge_features = self._get_edge_features()
-
-        # 动作掩码
         action_mask = self._get_action_mask()
 
         return {
@@ -418,28 +411,29 @@ class USVSchedulingEnv(gym.Env):
         }
 
     def _get_usv_features(self):
-        """获取USV特征"""
+        """获取USV特征 - 增加时间特征"""
+        # 添加完成时间作为重要特征
+        max_time = max(np.max(self.usv_next_available_time), 1.0)
+
         return np.column_stack([
-            self.usv_positions / 500.0,  # 归一化位置
-            self.usv_batteries / self.battery_capacity,  # 归一化电量
-            self.usv_speeds / np.max(self.speed_range)  # 归一化速度
+            self.usv_positions / 500.0,
+            self.usv_batteries / self.battery_capacity,
+            self.usv_speeds / np.max(self.speed_range),
+            self.usv_next_available_time / max_time  # 归一化的完成时间
         ])
 
     def _get_task_features(self):
         """获取任务特征"""
         task_features = np.zeros((self.num_tasks, 6))
 
-        # 位置特征
         task_features[:, :2] = self.tasks['coords'] / 500.0
 
-        # 处理时间特征
         proc_times = self.tasks['processing_time']
         if isinstance(proc_times[0], (list, np.ndarray)):
             task_features[:, 2:5] = proc_times / 100.0
         else:
             task_features[:, 2:5] = np.column_stack([proc_times, proc_times, proc_times]) / 100.0
 
-        # 待处理标记
         for task_idx in range(self.num_tasks):
             if task_idx not in self.scheduled_tasks:
                 task_features[task_idx, 5] = 1.0
@@ -463,7 +457,6 @@ class USVSchedulingEnv(gym.Env):
         """获取动作掩码"""
         action_mask = np.zeros(self.num_usvs * self.num_tasks, dtype=np.bool_)
 
-        # 只有未调度的任务对应的动作才有效
         for task_idx in range(self.num_tasks):
             if task_idx not in self.scheduled_tasks:
                 for usv_idx in range(self.num_usvs):
@@ -473,7 +466,7 @@ class USVSchedulingEnv(gym.Env):
         return action_mask
 
     def get_valid_actions(self):
-        """获取当前有效的动作列表（调试用）"""
+        """获取当前有效的动作列表"""
         valid_actions = []
         for task_idx in range(self.num_tasks):
             if task_idx not in self.scheduled_tasks:
@@ -489,7 +482,8 @@ class USVSchedulingEnv(gym.Env):
             print(f"环境状态 - 时间: {self.current_time:.2f}")
             print(f"{'=' * 50}")
             print(f"已调度任务: {len(self.scheduled_tasks)}/{self.num_tasks}")
-            print(f"当前makespan: {np.max(self.usv_next_available_time):.2f}")
+            print(f"当前makespan: {self.current_makespan:.2f}")
+            print(f"Makespan变化: {self.last_makespan:.2f} -> {self.current_makespan:.2f}")
 
             print(f"\nUSV状态:")
             for i in range(self.num_usvs):

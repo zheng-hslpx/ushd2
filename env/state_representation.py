@@ -18,8 +18,8 @@ def build_heterogeneous_graph(usv_features, task_features, usv_task_distances, e
     """
 
     # --- 添加调试信息 ---
-    print(f"Debug: usv_features shape: {usv_features.shape}")
-    print(f"Debug: task_features shape: {task_features.shape}")
+    # print(f"Debug: usv_features shape: {usv_features.shape}")
+    # print(f"Debug: task_features shape: {task_features.shape}")
     # --------------------
 
     num_tasks = len(task_features)
