@@ -94,15 +94,15 @@ class StableUSVHeteroGNN(nn.Module):
     def forward(self, graph):
 
         # --- 添加调试信息 ---
-        print(f"Debug: Graph node types: {graph.ntypes}")
-        print(f"Debug: Graph expected 'usv'? {'usv' in graph.ntypes}")
-        print(f"Debug: Graph expected 'task'? {'task' in graph.ntypes}")
-        if 'usv' in graph.ntypes:
-            print(f"Debug: Number of 'usv' nodes: {graph.num_nodes('usv')}")
-            print(f"Debug: 'usv' node features exist? {'feat' in graph.nodes['usv'].data}")
-        if 'task' in graph.ntypes:
-            print(f"Debug: Number of 'task' nodes: {graph.num_nodes('task')}")
-            print(f"Debug: 'task' node features exist? {'feat' in graph.nodes['task'].data}")
+        # print(f"Debug: Graph node types: {graph.ntypes}")
+        # print(f"Debug: Graph expected 'usv'? {'usv' in graph.ntypes}")
+        # print(f"Debug: Graph expected 'task'? {'task' in graph.ntypes}")
+        # if 'usv' in graph.ntypes:
+        #     print(f"Debug: Number of 'usv' nodes: {graph.num_nodes('usv')}")
+        #     print(f"Debug: 'usv' node features exist? {'feat' in graph.nodes['usv'].data}")
+        # if 'task' in graph.ntypes:
+        #     print(f"Debug: Number of 'task' nodes: {graph.num_nodes('task')}")
+        #     print(f"Debug: 'task' node features exist? {'feat' in graph.nodes['task'].data}")
         # --------------------
 
         """前向传播"""
@@ -165,83 +165,3 @@ class StableUSVHeteroGNN(nn.Module):
 
         return pooled
 
-
-# class LightweightHGNN(nn.Module):
-#     """
-#     轻量级HGNN（备选方案）
-#     适用于快速训练和推理
-#     """
-#
-#     def __init__(self, usv_feat_dim, task_feat_dim, hidden_dim=128):
-#         super().__init__()
-#
-#         self.hidden_dim = hidden_dim
-#
-#         # 简单的特征变换
-#         self.usv_transform = nn.Linear(usv_feat_dim, hidden_dim)
-#         self.task_transform = nn.Linear(task_feat_dim, hidden_dim)
-#
-#         # 消息传递层
-#         self.message_layer = dglnn.GraphConv(hidden_dim, hidden_dim,
-#                                              norm='both',
-#                                              weight=True,
-#                                              bias=True,
-#                                              activation=F.relu)
-#
-#         # 输出层
-#         self.output = nn.Sequential(
-#             nn.Linear(hidden_dim * 2, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, hidden_dim)
-#         )
-#
-#     def forward(self, graph):
-#         """前向传播"""
-#         # 特征变换
-#         usv_h = F.relu(self.usv_transform(graph.nodes['usv'].data['feat']))
-#         task_h = F.relu(self.task_transform(graph.nodes['task'].data['feat']))
-#
-#         # 创建同构图进行消息传递
-#         num_usv = usv_h.shape[0]
-#         num_task = task_h.shape[0]
-#
-#         # 合并特征
-#         all_h = torch.cat([usv_h, task_h], dim=0)
-#
-#         # 构建同构图的边（简化处理）
-#         src = []
-#         dst = []
-#
-#         # USV到任务的边
-#         for i in range(num_usv):
-#             for j in range(num_task):
-#                 src.append(i)
-#                 dst.append(num_usv + j)
-#
-#         # 任务之间的边（可选）
-#         for i in range(num_task):
-#             for j in range(min(3, num_task)):  # 每个任务连接3个最近邻
-#                 if i != j:
-#                     src.append(num_usv + i)
-#                     dst.append(num_usv + j)
-#
-#         # 创建DGL图
-#         homo_graph = dgl.graph((src, dst))
-#         homo_graph = homo_graph.to(graph.device)
-#
-#         # 消息传递
-#         h_updated = self.message_layer(homo_graph, all_h)
-#
-#         # 分离USV和任务特征
-#         usv_h_updated = h_updated[:num_usv]
-#         task_h_updated = h_updated[num_usv:]
-#
-#         # 全局池化
-#         usv_global = torch.mean(usv_h_updated, dim=0)
-#         task_global = torch.mean(task_h_updated, dim=0)
-#
-#         # 输出
-#         global_feat = torch.cat([usv_global, task_global], dim=-1)
-#         output = self.output(global_feat)
-#
-#         return output
